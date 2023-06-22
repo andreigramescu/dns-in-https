@@ -2,7 +2,7 @@
 
 ## //evaluation
 
-Contains the codu used during the evaluation section of the report.
+Contains the code used during the evaluation section of the report.
 Includes code for the experiments and benchmark comparisons.
 
 The `save` and `plots` directories contain the backed up experiment data
