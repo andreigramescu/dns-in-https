@@ -1,0 +1,793 @@
+diff --git a/net/dns/BUILD.gn b/net/dns/BUILD.gn
+index 6eb142954e6a9..4bff76cdab4f9 100644
+--- a/net/dns/BUILD.gn
++++ b/net/dns/BUILD.gn
+@@ -36,6 +36,8 @@ source_set("dns") {
+     "address_sorter.h",
+     "context_host_resolver.cc",
+     "context_host_resolver.h",
++    "dih_entry.cc",
++    "dih_entry.h",
+     "dns_alias_utility.cc",
+     "dns_alias_utility.h",
+     "dns_config.cc",
+@@ -401,6 +403,7 @@ source_set("tests") {
+   sources = [
+     "address_info_unittest.cc",
+     "context_host_resolver_unittest.cc",
++    "dih_entry_unittest.cc",
+     "dns_alias_utility_unittest.cc",
+     "dns_config_service_unittest.cc",
+     "dns_hosts_unittest.cc",
+@@ -524,6 +527,16 @@ proto_library("host_cache_fuzzer_proto") {
+   deps = [ "//testing/libfuzzer/proto:json_proto" ]
+ }
+ 
++fuzzer_test("dih_entry_fuzzer") {
++  sources = [ "dih_entry_fuzzer.cc" ]
++  deps = [
++    "//base",
++    "//net",
++    "//net:net_fuzzer_test_support",
++  ]
++  # dict = "//testing/libfuzzer/fuzzers/dicts/json.dict"
++}
++
+ fuzzer_test("net_dns_host_cache_fuzzer") {
+   sources = [ "host_cache_fuzzer.cc" ]
+   deps = [
+diff --git a/net/dns/dih_entry.cc b/net/dns/dih_entry.cc
+new file mode 100644
+index 0000000000000..d6915bd189d69
+--- /dev/null
++++ b/net/dns/dih_entry.cc
+@@ -0,0 +1,66 @@
++#include "base/strings/string_split.h"
++#include "net/dns/dih_entry.h"
++#include "url/gurl.h"
++
++namespace net {
++
++DihEntry::DihEntry() : is_valid_(false) {}
++
++DihEntry::DihEntry(
++    const std::string& domain,
++    const IPAddress& ip,
++    int ttl_seconds)
++    : domain_(domain),
++      ip_(ip),
++      ttl_seconds_(ttl_seconds),
++      is_valid_(true) {}
++
++DihEntry::~DihEntry() = default;
++
++// // static
++DihEntry DihEntry::FromString(const std::string& str) {
++    auto tokens = base::SplitString(
++        str,
++        "|",
++        base::TRIM_WHITESPACE,
++        base::SPLIT_WANT_ALL);
++    if (tokens.size() < 3) {
++      return DihEntry();
++    }
++
++    // Check host
++    if (!GURL(std::string("https://") + tokens[0]).is_valid()) {
++        return DihEntry();
++    }
++
++    // Check IP
++    auto ip = IPAddress::FromIPLiteral(tokens[1]);
++    if (!ip.has_value()) {
++        return DihEntry();
++    }
++
++    // Check ttl
++    int seconds;
++    if (!base::StringToInt(tokens[2], &seconds) || seconds < 0) {
++        return DihEntry();
++    }
++
++    return DihEntry(tokens[0], ip.value(), seconds);
++}
++
++DihEntry::DihEntry(const DihEntry& other) = default;
++
++DihEntry::DihEntry(DihEntry&& other) noexcept = default;
++
++bool DihEntry::operator==(const DihEntry& other) const {
++    return (is_valid_ == other.is_valid_)
++            && (domain_ == other.domain_)
++            && (ip_ == other.ip_)
++            && (ttl_seconds_ == other.ttl_seconds_);
++}
++
++bool DihEntry::operator!=(const DihEntry& other) const {
++    return !(*this == other);
++}
++
++}
+\ No newline at end of file
+diff --git a/net/dns/dih_entry.h b/net/dns/dih_entry.h
+new file mode 100644
+index 0000000000000..6b47fb2e3644e
+--- /dev/null
++++ b/net/dns/dih_entry.h
+@@ -0,0 +1,60 @@
++#ifndef NET_DNS_DIH_ENTRY_H
++#define NET_DNS_DIH_ENTRY_H
++
++#include <string>
++
++#include "net/base/ip_address.h"
++#include "net/base/net_export.h"
++
++namespace net {
++
++// Representation of a single dih entry from inside the dih header to be cached
++class NET_EXPORT_PRIVATE DihEntry {
++
++public:
++    // creates an invalid entry
++    DihEntry();
++
++    // creates a valid entry. assumes all given fields are valid
++    explicit DihEntry(
++        const std::string& domain,
++        const IPAddress& ip,
++        int ttl_seconds);
++
++    ~DihEntry();
++
++    // parses a string into a DihEntry, as defined by the DiH spec.
++    static DihEntry FromString(const std::string& str);
++
++    DihEntry(const DihEntry& other);
++
++    DihEntry(DihEntry&& other) noexcept;
++
++    bool operator==(const DihEntry& other) const;
++    bool operator!=(const DihEntry& other) const;
++
++    std::string domain() const {
++        return domain_;
++    }
++
++    IPAddress ip() const {
++        return ip_;
++    }
++
++    int ttl() const {
++        return ttl_seconds_;
++    }
++
++    bool is_valid() const {
++        return is_valid_;
++    }
++private:
++    const std::string domain_;
++    const IPAddress ip_;
++    int ttl_seconds_;
++    bool is_valid_;
++};
++
++}
++
++#endif  // NET_DNS_DIH_ENTRY_H
+\ No newline at end of file
+diff --git a/net/dns/dih_entry_fuzzer.cc b/net/dns/dih_entry_fuzzer.cc
+new file mode 100644
+index 0000000000000..bdcad390b39b6
+--- /dev/null
++++ b/net/dns/dih_entry_fuzzer.cc
+@@ -0,0 +1,24 @@
++#include <stddef.h>
++#include <stdint.h>
++
++#include <string>
++
++#include "net/dns/dih_entry.h"
++
++extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
++  if (size < 1)
++    return 0;
++
++  {
++    std::string str_input(reinterpret_cast<const char*>(data), size);
++    // std::string str_input = string_piece_input;
++    const auto entry = net::DihEntry::FromString(str_input);
++
++    // test that the getters work after construction
++    entry.is_valid();
++    entry.domain();
++    entry.ip();
++    entry.ttl();
++  }
++  return 0;
++}
+\ No newline at end of file
+diff --git a/net/dns/dih_entry_unittest.cc b/net/dns/dih_entry_unittest.cc
+new file mode 100644
+index 0000000000000..2da3d46590be3
+--- /dev/null
++++ b/net/dns/dih_entry_unittest.cc
+@@ -0,0 +1,86 @@
++#include "net/dns/dih_entry.h"
++
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace net {
++
++namespace {
++
++TEST(DihEntryTest, ConstructInvalid) {
++  DihEntry entry;
++  ASSERT_FALSE(entry.is_valid());
++}
++
++TEST(DihEntryTest, ConstructValid) {
++  DihEntry entry("example.com", IPAddress(100, 100, 42, 42), 100);
++  ASSERT_TRUE(entry.is_valid());
++}
++
++TEST(DihEntryTest, ConstructionSettingFields) {
++  auto ip = IPAddress(100, 100, 42, 42);
++  DihEntry entry("example.com", ip, 100);
++  ASSERT_EQ(entry.domain(), "example.com");
++  ASSERT_EQ(entry.ip(), ip);
++  ASSERT_EQ(entry.ttl(), 100);
++}
++
++TEST(DihEntryTest, ConstructFromEmptyString) {
++  auto entry = DihEntry::FromString("");
++  ASSERT_FALSE(entry.is_valid());
++}
++
++TEST(DihEntryTest, ConstructInvalidDomain) {
++  auto entry1 = DihEntry::FromString("chr~~ome.com|123.123.123.123|4567");
++  ASSERT_FALSE(entry1.is_valid());
++}
++
++TEST(DihEntryTest, ConstructInvalidIp) {
++  auto entry1 = DihEntry::FromString("chrome.com|123,123.123.123|4567");
++  ASSERT_FALSE(entry1.is_valid());
++
++  auto entry2 = DihEntry::FromString("exam!ple.com|500.123.123.123|4567");
++  ASSERT_FALSE(entry2.is_valid());
++
++  auto entry3 = DihEntry::FromString("exam!ple.com|500abc.123.123|4567");
++  ASSERT_FALSE(entry3.is_valid());
++}
++
++TEST(DihEntryTest, ConstructInvalidTTL) {
++  auto entry1 = DihEntry::FromString("chrome.com|123.123.123.123|invalid");
++  ASSERT_FALSE(entry1.is_valid());
++
++  auto entry2 = DihEntry::FromString("exam!ple.com|123.123.123.123|-123");
++  ASSERT_FALSE(entry2.is_valid());
++}
++
++TEST(DihEntryTest, ConstructFromString) {
++  auto entry1 = DihEntry::FromString("chrome.com|123.123.123.123|4269");
++  ASSERT_TRUE(entry1.is_valid());
++  ASSERT_EQ(entry1.domain(), "chrome.com");
++  ASSERT_EQ(entry1.ip(), IPAddress(123, 123, 123, 123));
++  ASSERT_EQ(entry1.ttl(), 4269);
++
++  auto entry2 = DihEntry::FromString("xdih.com|32.120.89.5|0");
++  ASSERT_TRUE(entry2.is_valid());
++  ASSERT_EQ(entry2.domain(), "xdih.com");
++  ASSERT_EQ(entry2.ip(), IPAddress(32, 120, 89, 5));
++  ASSERT_EQ(entry2.ttl(), 0);
++}
++
++TEST(DihEntryTest, Equality) {
++  auto entry1 = DihEntry::FromString("chrome.com|123.123.123.123|4269");
++  ASSERT_EQ(entry1, DihEntry::FromString("chrome.com|123.123.123.123|4269"));
++
++  std::string domain = "xdih.com";
++  IPAddress ip(23, 45, 67, 89);
++  int ttl = 20;
++  DihEntry entry2(domain, ip, ttl);
++  ASSERT_NE(entry2, DihEntry(domain, ip, 19));
++  ASSERT_NE(entry2, DihEntry(domain, IPAddress(22, 45, 67, 89), ttl));
++  ASSERT_EQ(DihEntry::FromString("xdih.com|23.45.67.89|20"), entry2);
++}
++
++}
++
++}
+\ No newline at end of file
+diff --git a/net/dns/dns_test_util.cc b/net/dns/dns_test_util.cc
+index 92510f813d8e0..cdd11629a921e 100644
+--- a/net/dns/dns_test_util.cc
++++ b/net/dns/dns_test_util.cc
+@@ -642,7 +642,8 @@ std::unique_ptr<DnsTransaction> MockDnsTransactionFactory::CreateTransaction(
+     bool secure,
+     SecureDnsMode secure_dns_mode,
+     ResolveContext* resolve_context,
+-    bool fast_timeout) {
++    bool fast_timeout,
++    absl::optional<DnsOverHttpsServerConfig> dih_config) {
+   std::unique_ptr<MockTransaction> transaction =
+       std::make_unique<MockTransaction>(rules_, std::move(hostname), qtype,
+                                         secure, force_doh_server_available_,
+diff --git a/net/dns/dns_test_util.h b/net/dns/dns_test_util.h
+index 5269e615add73..09f104829b988 100644
+--- a/net/dns/dns_test_util.h
++++ b/net/dns/dns_test_util.h
+@@ -355,7 +355,8 @@ class MockDnsTransactionFactory : public DnsTransactionFactory {
+       bool secure,
+       SecureDnsMode secure_dns_mode,
+       ResolveContext* resolve_context,
+-      bool fast_timeout) override;
++      bool fast_timeout,
++      absl::optional<DnsOverHttpsServerConfig> dih_config = absl::nullopt) override;
+ 
+   std::unique_ptr<DnsProbeRunner> CreateDohProbeRunner(
+       ResolveContext* resolve_context) override;
+diff --git a/net/dns/dns_transaction.cc b/net/dns/dns_transaction.cc
+index d89174ba20270..2f4817910e843 100644
+--- a/net/dns/dns_transaction.cc
++++ b/net/dns/dns_transaction.cc
+@@ -678,6 +678,35 @@ void ConstructDnsHTTPAttempt(DnsSession* session,
+       isolation_info, request_priority, is_probe));
+ }
+ 
++void ConstructDnsHTTPAttempt(const DnsOverHttpsServerConfig& doh_server,
++                             size_t null_idx,
++                             base::span<const uint8_t> qname,
++                             uint16_t qtype,
++                             const OptRecordRdata* opt_rdata,
++                             std::vector<std::unique_ptr<DnsAttempt>>* attempts,
++                             URLRequestContext* url_request_context,
++                             const IsolationInfo& isolation_info,
++                             RequestPriority request_priority,
++                             bool is_probe) {
++  DCHECK(url_request_context);
++
++  std::unique_ptr<DnsQuery> query;
++  if (attempts->empty()) {
++    query =
++        std::make_unique<DnsQuery>(/*id=*/0, qname, qtype, opt_rdata,
++                                   DnsQuery::PaddingStrategy::BLOCK_LENGTH_128);
++  } else {
++    query = std::make_unique<DnsQuery>(*attempts->at(0)->GetQuery());
++  }
++
++  GURL gurl_without_parameters(
++      GetURLFromTemplateWithoutParameters(doh_server.server_template()));
++  attempts->push_back(std::make_unique<DnsHTTPAttempt>(
++      null_idx, std::move(query), doh_server.server_template(),
++      gurl_without_parameters, doh_server.use_post(), url_request_context,
++      isolation_info, request_priority, is_probe));
++}
++
+ class DnsTCPAttempt : public DnsAttempt {
+  public:
+   DnsTCPAttempt(size_t server_index,
+@@ -1149,6 +1178,7 @@ class DnsTransactionImpl : public DnsTransaction,
+                      const OptRecordRdata* opt_rdata,
+                      bool secure,
+                      SecureDnsMode secure_dns_mode,
++                     absl::optional<DnsOverHttpsServerConfig> dih_config,
+                      ResolveContext* resolve_context,
+                      bool fast_timeout)
+       : session_(session),
+@@ -1157,6 +1187,7 @@ class DnsTransactionImpl : public DnsTransaction,
+         opt_rdata_(opt_rdata),
+         secure_(secure),
+         secure_dns_mode_(secure_dns_mode),
++        dih_config_(dih_config),
+         fast_timeout_(fast_timeout),
+         net_log_(net_log),
+         resolve_context_(resolve_context->AsSafeRef()) {
+@@ -1402,11 +1433,20 @@ class DnsTransactionImpl : public DnsTransaction,
+     size_t doh_server_index = dns_server_iterator_->GetNextAttemptIndex();
+ 
+     unsigned attempt_number = attempts_.size();
+-    ConstructDnsHTTPAttempt(session_.get(), doh_server_index, qnames_.front(),
+-                            qtype_, opt_rdata_, &attempts_,
+-                            resolve_context_->url_request_context(),
+-                            resolve_context_->isolation_info(),
+-                            request_priority_, /*is_probe=*/false);
++    if (dih_config_.has_value()) {
++      auto null_idx = session_->config().doh_config.servers().size();
++      ConstructDnsHTTPAttempt(dih_config_.value(), null_idx, qnames_.front(),
++                              qtype_, opt_rdata_, &attempts_,
++                              resolve_context_->url_request_context(),
++                              resolve_context_->isolation_info(),
++                              request_priority_, /*is_probe=*/false);
++    } else {
++      ConstructDnsHTTPAttempt(session_.get(), doh_server_index, qnames_.front(),
++                              qtype_, opt_rdata_, &attempts_,
++                              resolve_context_->url_request_context(),
++                              resolve_context_->isolation_info(),
++                              request_priority_, /*is_probe=*/false);
++    }
+     ++attempts_count_;
+     DnsAttempt* attempt = attempts_.back().get();
+     // Associate this attempt with the DoH request in NetLog.
+@@ -1524,7 +1564,9 @@ class DnsTransactionImpl : public DnsTransaction,
+                          int rv) {
+     DCHECK_LT(attempt_number, attempts_.size());
+     const DnsAttempt* attempt = attempts_[attempt_number].get();
+-    if (record_rtt && attempt->GetResponse()) {
++    auto null_idx = session_->config().doh_config.servers().size();
++    bool is_dih_override = attempt->server_index() == null_idx;
++    if (record_rtt && attempt->GetResponse() && !is_dih_override) {
+       resolve_context_->RecordRtt(
+           attempt->server_index(), secure_ /* is_doh_server */,
+           base::TimeTicks::Now() - start, rv, session_.get());
+@@ -1558,20 +1600,26 @@ class DnsTransactionImpl : public DnsTransaction,
+     while (result.rv != ERR_IO_PENDING) {
+       LogResponse(result.attempt);
+ 
++      auto null_idx = session_->config().doh_config.servers().size();
++      bool is_dih_override = result.attempt->server_index() == null_idx;
+       switch (result.rv) {
+         case OK:
+-          resolve_context_->RecordServerSuccess(result.attempt->server_index(),
+-                                                secure_ /* is_doh_server */,
+-                                                session_.get());
++          if (!is_dih_override) {
++            resolve_context_->RecordServerSuccess(result.attempt->server_index(),
++                                                  secure_ /* is_doh_server */,
++                                                  session_.get());
++          }
+           net_log_.EndEventWithNetErrorCode(
+               NetLogEventType::DNS_TRANSACTION_QUERY, result.rv);
+           DCHECK(result.attempt);
+           DCHECK(result.attempt->GetResponse());
+           return result;
+         case ERR_NAME_NOT_RESOLVED:
+-          resolve_context_->RecordServerSuccess(result.attempt->server_index(),
+-                                                secure_ /* is_doh_server */,
+-                                                session_.get());
++          if (!is_dih_override) {
++            resolve_context_->RecordServerSuccess(result.attempt->server_index(),
++                                                  secure_ /* is_doh_server */,
++                                                  session_.get());
++          }
+           net_log_.EndEventWithNetErrorCode(
+               NetLogEventType::DNS_TRANSACTION_QUERY, result.rv);
+           // Try next suffix. Check that qnames_ isn't already empty first,
+@@ -1591,9 +1639,13 @@ class DnsTransactionImpl : public DnsTransaction,
+ 
+           if (result.attempt) {
+             DCHECK(result.attempt == attempts_.back().get());
+-            resolve_context_->RecordServerFailure(
+-                result.attempt->server_index(), secure_ /* is_doh_server */,
+-                result.rv, session_.get());
++            if (is_dih_override) {
++              dih_config_ = absl::nullopt;
++            } else {
++              resolve_context_->RecordServerFailure(
++                  result.attempt->server_index(), secure_ /* is_doh_server */,
++                  result.rv, session_.get());
++            }
+           }
+           if (MoreAttemptsAllowed()) {
+             result = MakeAttempt();
+@@ -1625,9 +1677,13 @@ class DnsTransactionImpl : public DnsTransaction,
+           // failure.
+           if (result.attempt == attempts_.back().get()) {
+             timer_.Stop();
+-            resolve_context_->RecordServerFailure(
+-                result.attempt->server_index(), secure_ /* is_doh_server */,
+-                result.rv, session_.get());
++            if (is_dih_override) {
++              dih_config_ = absl::nullopt;
++            } else {
++              resolve_context_->RecordServerFailure(
++                  result.attempt->server_index(), secure_ /* is_doh_server */,
++                  result.rv, session_.get());
++            }
+ 
+             if (MoreAttemptsAllowed()) {
+               result = MakeAttempt();
+@@ -1713,6 +1769,7 @@ class DnsTransactionImpl : public DnsTransaction,
+   raw_ptr<const OptRecordRdata, DanglingUntriaged> opt_rdata_;
+   const bool secure_;
+   const SecureDnsMode secure_dns_mode_;
++  absl::optional<DnsOverHttpsServerConfig> dih_config_;
+   // Cleared in DoCallback.
+   ResponseCallback callback_;
+ 
+@@ -1764,10 +1821,11 @@ class DnsTransactionFactoryImpl : public DnsTransactionFactory {
+       bool secure,
+       SecureDnsMode secure_dns_mode,
+       ResolveContext* resolve_context,
+-      bool fast_timeout) override {
++      bool fast_timeout,
++      absl::optional<DnsOverHttpsServerConfig> dih_config) override {
+     return std::make_unique<DnsTransactionImpl>(
+         session_.get(), std::move(hostname), qtype, net_log, opt_rdata_.get(),
+-        secure, secure_dns_mode, resolve_context, fast_timeout);
++        secure, secure_dns_mode, dih_config, resolve_context, fast_timeout);
+   }
+ 
+   std::unique_ptr<DnsProbeRunner> CreateDohProbeRunner(
+diff --git a/net/dns/dns_transaction.h b/net/dns/dns_transaction.h
+index 470e5cf057035..e24b61648135a 100644
+--- a/net/dns/dns_transaction.h
++++ b/net/dns/dns_transaction.h
+@@ -16,6 +16,7 @@
+ #include "base/time/time.h"
+ #include "net/base/request_priority.h"
+ #include "net/dns/opt_record_rdata.h"
++#include "net/dns/public/dns_over_https_server_config.h"
+ #include "net/dns/public/secure_dns_mode.h"
+ #include "net/dns/record_rdata.h"
+ #include "third_party/abseil-cpp/absl/types/optional.h"
+@@ -116,7 +117,8 @@ class NET_EXPORT_PRIVATE DnsTransactionFactory {
+       bool secure,
+       SecureDnsMode secure_dns_mode,
+       ResolveContext* resolve_context,
+-      bool fast_timeout) = 0;
++      bool fast_timeout,
++      absl::optional<DnsOverHttpsServerConfig> dih_config = absl::nullopt) = 0;
+ 
+   // Creates a runner to run the DoH probe sequence for all configured DoH
+   // resolvers.
+diff --git a/net/dns/host_resolver.h b/net/dns/host_resolver.h
+index ddcab8f509ba9..06d465272aa22 100644
+--- a/net/dns/host_resolver.h
++++ b/net/dns/host_resolver.h
+@@ -362,6 +362,12 @@ class NET_EXPORT HostResolver {
+ 
+     // Controls the resolver's Secure DNS behavior for this request.
+     SecureDnsPolicy secure_dns_policy = SecureDnsPolicy::kAllow;
++
++    // Controls if hostnames of HTTPS requests during the lifetime of a
++    // page should be resolved, via DoH, through the web server of the page,
++    // rather than through one of the doh providers in the global DNS config.
++    // Dynamic DiH
++    bool dih_override = true;
+   };
+ 
+   // Handler for an ongoing MDNS listening operation. Created by
+diff --git a/net/dns/host_resolver_manager.cc b/net/dns/host_resolver_manager.cc
+index 5318e289e60e5..7f573db7929c1 100644
+--- a/net/dns/host_resolver_manager.cc
++++ b/net/dns/host_resolver_manager.cc
+@@ -752,6 +752,7 @@ class HostResolverManager::RequestImpl
+   }
+ 
+   int DoStartJob() {
++    dih_config_ = InitializeDihConfig();
+     resolver_->CreateAndStartJob(std::move(job_key_), std::move(tasks_), this);
+     DCHECK(!complete_);
+     resolver_.reset();
+@@ -891,6 +892,36 @@ class HostResolverManager::RequestImpl
+   RequestPriority priority() const { return priority_; }
+   void set_priority(RequestPriority priority) { priority_ = priority; }
+ 
++  absl::optional<DnsOverHttpsServerConfig> InitializeDihConfig() {
++    auto host = job_key_.host;
++    auto domain_str = absl::holds_alternative<url::SchemeHostPort>(host)
++                    ? absl::get<url::SchemeHostPort>(host).host()
++                    : absl::get<std::string>(host);
++
++    if (parameters_.dih_override &&
++        network_anonymization_key_.IsFullyPopulated() &&
++        !network_anonymization_key_.IsTransient()) {
++      auto top_url = network_anonymization_key_.GetTopFrameSite()->GetURL();
++      if (!top_url.SchemeIs("https")) {
++        return absl::nullopt;
++      }
++
++      auto top_origin = network_anonymization_key_.GetTopFrameSite()->Serialize();
++      bool is_same_as_origin = top_origin.find(domain_str) != std::string::npos;
++      if (is_same_as_origin) {
++        return absl::nullopt;
++      }
++
++      return DnsOverHttpsServerConfig::FromString(top_origin + "/dns-query");
++    }
++
++    return absl::nullopt;
++  }
++
++  absl::optional<DnsOverHttpsServerConfig> dih_config() const {
++    return dih_config_;
++  }
++
+   bool complete() const { return complete_; }
+ 
+  private:
+@@ -1020,6 +1051,8 @@ class HostResolverManager::RequestImpl
+ 
+   SEQUENCE_CHECKER(sequence_checker_);
+ 
++  absl::optional<DnsOverHttpsServerConfig> dih_config_;
++
+   base::WeakPtrFactory<RequestImpl> weak_ptr_factory_{this};
+ };
+ 
+@@ -1131,6 +1164,7 @@ class HostResolverManager::DnsTask : public base::SupportsWeakPtr<DnsTask> {
+           ResolveContext* resolve_context,
+           bool secure,
+           SecureDnsMode secure_dns_mode,
++          absl::optional<DnsOverHttpsServerConfig> dih_config,
+           Delegate* delegate,
+           const NetLogWithSource& job_net_log,
+           const base::TickClock* tick_clock,
+@@ -1141,6 +1175,7 @@ class HostResolverManager::DnsTask : public base::SupportsWeakPtr<DnsTask> {
+         resolve_context_(resolve_context->AsSafeRef()),
+         secure_(secure),
+         secure_dns_mode_(secure_dns_mode),
++        dih_config_(dih_config),
+         delegate_(delegate),
+         net_log_(job_net_log),
+         tick_clock_(tick_clock),
+@@ -1343,7 +1378,8 @@ class HostResolverManager::DnsTask : public base::SupportsWeakPtr<DnsTask> {
+             std::move(transaction_hostname),
+             DnsQueryTypeToQtype(transaction_info.type), net_log_, secure_,
+             secure_dns_mode_, &*resolve_context_,
+-            fallback_available_ /* fast_timeout */);
++            fallback_available_ /* fast_timeout */,
++            dih_config_);
+     transaction_info.transaction->SetRequestPriority(delegate_->priority());
+ 
+     auto transaction_info_it =
+@@ -1897,6 +1933,8 @@ class HostResolverManager::DnsTask : public base::SupportsWeakPtr<DnsTask> {
+   const bool secure_;
+   const SecureDnsMode secure_dns_mode_;
+ 
++  absl::optional<DnsOverHttpsServerConfig> dih_config_;
++
+   // The listener to the results of this DnsTask.
+   const raw_ptr<Delegate> delegate_;
+   const NetLogWithSource net_log_;
+@@ -2023,6 +2061,10 @@ class HostResolverManager::Job : public PrioritizedDispatcher::Job,
+     DCHECK_EQ(GetHostname(key_.host),
+               request->request_host().GetHostnameWithoutBrackets());
+ 
++    if (!requests_.empty()) {
++      DCHECK(requests_.head()->value()->dih_config() == request->dih_config());
++    }
++
+     request->AssignJob(weak_ptr_factory_.GetSafeRef());
+ 
+     priority_tracker_.Add(request->priority());
+@@ -2462,11 +2504,12 @@ class HostResolverManager::Job : public PrioritizedDispatcher::Job,
+     DCHECK_EQ(secure, !dispatched_);
+     DCHECK_EQ(dispatched_ ? 1 : 0, num_occupied_job_slots_);
+     DCHECK(!resolver_->ShouldForceSystemResolverDueToTestOverride());
++    auto dih_config = requests_.head()->value()->dih_config();
+     // Need to create the task even if we're going to post a failure instead of
+     // running it, as a "started" job needs a task to be properly cleaned up.
+     dns_task_ = std::make_unique<DnsTask>(
+         resolver_->dns_client_.get(), key_.host, key_.query_types,
+-        &*key_.resolve_context, secure, key_.secure_dns_mode, this, net_log_,
++        &*key_.resolve_context, secure, key_.secure_dns_mode, dih_config, this, net_log_,
+         tick_clock_, !tasks_.empty() /* fallback_available */,
+         https_svcb_options_);
+     dns_task_->StartNextTransaction();
+diff --git a/net/socket/transport_connect_job.cc b/net/socket/transport_connect_job.cc
+index 64bf8fa065225..778381abe73df 100644
+--- a/net/socket/transport_connect_job.cc
++++ b/net/socket/transport_connect_job.cc
+@@ -256,6 +256,7 @@ int TransportConnectJob::DoResolveHost() {
+   HostResolver::ResolveHostParameters parameters;
+   parameters.initial_priority = priority();
+   parameters.secure_dns_policy = params_->secure_dns_policy();
++  parameters.dih_override = true;
+   if (absl::holds_alternative<url::SchemeHostPort>(params_->destination())) {
+     request_ = host_resolver()->CreateRequest(
+         absl::get<url::SchemeHostPort>(params_->destination()),
+diff --git a/net/url_request/url_request_http_job.cc b/net/url_request/url_request_http_job.cc
+index 00b3c891bf3bd..e625d5d4b1c67 100644
+--- a/net/url_request/url_request_http_job.cc
++++ b/net/url_request/url_request_http_job.cc
+@@ -824,6 +824,76 @@ void URLRequestHttpJob::AnnotateAndMoveUserBlockedCookies(
+   }
+ }
+ 
++void URLRequestHttpJob::MakeDIHEntry(const DihEntry& entry, base::TimeDelta cache_age) {
++  DCHECK(entry.is_valid());
++  auto domain = entry.domain();
++  auto ip = entry.ip();
++  auto seconds = entry.ttl();
++
++  HostCache* dns_cache = request()->context()->host_resolver()->GetHostCache();
++  const base::DefaultTickClock* tick_clock = base::DefaultTickClock::GetInstance();
++  DCHECK(dns_cache);
++  DCHECK(tick_clock);
++
++  // Create the cache entry
++  auto ttl = base::Seconds(seconds) - cache_age;
++  std::vector<IPEndPoint> ip_endpoints = { IPEndPoint(ip, 0) };
++  std::set<std::string> aliases = { domain };
++  HostCache::Entry dih_results(OK,
++                               ip_endpoints, aliases,
++                               HostCache::Entry::SOURCE_UNKNOWN,
++                               ttl);
++  dih_results.set_ip_endpoints(ip_endpoints);
++
++  // Create the cache key
++  auto nak_same_site = request()->isolation_info().network_anonymization_key();
++  auto nak_cross_site = NetworkAnonymizationKey::CreateCrossSite(
++      nak_same_site.GetTopFrameSite().value());
++
++  HostCache::Key key(domain,
++                     DnsQueryType::A,
++                     HOST_RESOLVER_DEFAULT_FAMILY_SET_DUE_TO_NO_IPV6,
++                     HostResolverSource::ANY,
++                     nak_same_site);
++  key.secure = true;
++
++  dns_cache->Set(key, dih_results, tick_clock->NowTicks(), ttl);
++  key.network_anonymization_key = nak_cross_site;
++  dns_cache->Set(key, dih_results, tick_clock->NowTicks(), ttl);
++}
++
++void URLRequestHttpJob::SaveDIHValuesIfPresent() {
++
++  std::string dih_header;
++  if (!GetResponseHeaders()->GetNormalizedHeader("X-Dih", &dih_header)) {
++    return;
++  }
++
++  base::TimeDelta cache_age;
++  if (!GetResponseHeaders()->GetAgeValue(&cache_age)) {
++    cache_age = base::Seconds(0);
++  }
++
++  HostCache* dns_cache = request()->context()->host_resolver()->GetHostCache();
++  const base::DefaultTickClock* tick_clock = base::DefaultTickClock::GetInstance();
++  if (!dns_cache || !tick_clock) {
++    return;
++  }
++
++  const base::StringPiece name("X-Dih");
++  std::string dih_resolution;
++  size_t iter = 0;
++  HttpResponseHeaders* headers = GetResponseHeaders();
++
++  while (headers->EnumerateHeader(&iter, name, &dih_resolution)) {
++    auto entry = DihEntry::FromString(dih_resolution);
++    if (entry.is_valid()) {
++      MakeDIHEntry(entry, cache_age);
++    }
++  }
++}
++
++
+ void URLRequestHttpJob::SaveCookiesAndNotifyHeadersComplete(int result) {
+   DCHECK(set_cookie_access_result_list_.empty());
+   // TODO(crbug.com/1186863): Turn this CHECK into DCHECK once the investigation
+@@ -1048,6 +1118,8 @@ void URLRequestHttpJob::OnStartCompleted(int result) {
+       }
+     }
+ 
++    SaveDIHValuesIfPresent();
++
+     SaveCookiesAndNotifyHeadersComplete(OK);
+   } else if (IsCertificateError(result)) {
+     // We encountered an SSL certificate error.
+diff --git a/net/url_request/url_request_http_job.h b/net/url_request/url_request_http_job.h
+index 0d6c64d85d95b..02e5a79bfd343 100644
+--- a/net/url_request/url_request_http_job.h
++++ b/net/url_request/url_request_http_job.h
+@@ -24,6 +24,7 @@
+ #include "net/base/privacy_mode.h"
+ #include "net/cookies/cookie_inclusion_status.h"
+ #include "net/cookies/cookie_partition_key.h"
++#include "net/dns/dih_entry.h"
+ #include "net/first_party_sets/first_party_set_metadata.h"
+ #include "net/first_party_sets/first_party_sets_cache_filter.h"
+ #include "net/http/http_request_info.h"
+@@ -109,6 +110,9 @@ class NET_EXPORT_PRIVATE URLRequestHttpJob : public URLRequestJob {
+ 
+   typedef base::RefCountedData<bool> SharedBoolean;
+ 
++  void SaveDIHValuesIfPresent();
++  void MakeDIHEntry(const DihEntry& dih_entry, base::TimeDelta cache_age);
++
+   // Shadows URLRequestJob's version of this method so we can grab cookies.
+   void NotifyHeadersComplete();
+ 
