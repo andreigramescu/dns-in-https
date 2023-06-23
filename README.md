@@ -17,11 +17,11 @@ logging code in the demo patch.
 - recompile and rerun the DiH unit tests: `autoninja -C out/Default/ net_unittests`, `./out/Default/net_unittests --gtest_filter="DihEntryTest.*"`
 - recompile and rerun the DiH fuzz tests:
 `tools/mb/mb.py gen -m chromium.fuzz -b 'Libfuzzer Local Linux ASan' out/libfuzzer`,
-`autoninja -C out/libfuzzer/ dih_entry_fuzzer`
-`./out/libfuzzer/dih_entry_fuzzer`
+`autoninja -C out/libfuzzer/ dih_entry_fuzzer`,
+`./out/libfuzzer/dih_entry_fuzzer`.
 For fuzzing inside chromium and the meaning of the fuzz test output,
 more information can be found at
-`https://chromium.googlesource.com/chromium/src/+/HEAD/testing/libfuzzer/README.md` and
+`https://chromium.googlesource.com/chromium/src/+/HEAD/testing/libfuzzer/README.md`, and
 `https://chromium.googlesource.com/chromium/src/+/HEAD/testing/libfuzzer/getting_started.md`.
 
 The patch files are in plaintext and can be read to see the code diff.
